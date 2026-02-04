@@ -412,6 +412,61 @@ async def top(update,ctx):
 
     await update.message.reply_text(text)
 
+# ======================
+# UPLOAD COMMAND (Admin Only)
+# ======================
+
+async def upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("❌ You are not admin")
+
+    if len(ctx.args) < 5:
+        return await update.message.reply_text(
+            "Usage:\n/upload <id> <name> <anime> <rarity> <photo_url>"
+        )
+
+    try:
+        char_id = int(ctx.args[0])
+        name = ctx.args[1]
+        anime = ctx.args[2]
+        rarity = ctx.args[3].upper()
+        photo_url = ctx.args[4]
+
+        if rarity not in ["SSR", "SR", "R", "N"]:
+            return await update.message.reply_text("❌ Invalid rarity: SSR/SR/R/N")
+
+        # Check if character already exists
+        if any(c["id"] == char_id for c in CHARS):
+            return await update.message.reply_text("❌ Character ID already exists")
+
+        # Add to memory
+        new_char = {
+            "id": char_id,
+            "name": name,
+            "anime": anime,
+            "rarity": rarity,
+            "image": photo_url
+        }
+        CHARS.append(new_char)
+
+        # Save to JSON
+        with open("characters.json", "w", encoding="utf-8") as f:
+            json.dump(CHARS, f, ensure_ascii=False, indent=4)
+
+        # Reply with photo
+        await update.message.reply_photo(
+            photo=photo_url,
+            caption=(
+                f"✅ Uploaded Character\n\n"
+                f"ID: {char_id}\n"
+                f"Name: {name}\n"
+                f"Anime: {anime}\n"
+                f"Rarity: {rarity}"
+            )
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 # ======================
 # MAIN
@@ -437,7 +492,7 @@ async def main():
     app.add_handler(CommandHandler("bal",bal))
     app.add_handler(CommandHandler("inv",inv))
     app.add_handler(CommandHandler("top",top))
-
+    app.add_handler(CommandHandler("upload", upload))
     print("✅ Bot Online")
 
     await app.run_polling()
