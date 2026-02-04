@@ -11,7 +11,9 @@ from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    MessageHandler,      # <--- Add this
     ContextTypes,
+    filters              # <--- Add this too
 )
 
 # ======================
