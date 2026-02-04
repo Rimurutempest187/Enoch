@@ -2,32 +2,40 @@ import os
 import json
 import random
 import asyncio
+import datetime
 
 import aiosqlite
 from dotenv import load_dotenv
 
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
 )
 
-# =====================
-# LOAD ENV
-# =====================
+# ======================
+# ENV
+# ======================
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB_FILE = "database.db"
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# =====================
-# GAME CONFIG
-# =====================
+DB = "database.db"
+
+# ======================
+# CONFIG
+# ======================
 
 START_COINS = 1000
 GACHA_COST = 100
+
+DAILY_REWARD = 200
+WEEKLY_REWARD = 1000
+
+DROP_TIME = 60  # seconds
 
 RARITY_RATE = {
     "SSR": 2,
@@ -36,26 +44,27 @@ RARITY_RATE = {
     "N": 60
 }
 
-# =====================
+# ======================
 # LOAD CHARACTERS
-# =====================
+# ======================
 
-with open("characters.json", "r", encoding="utf-8") as f:
-    CHARACTERS = json.load(f)
+with open("characters.json", encoding="utf-8") as f:
+    CHARS = json.load(f)
 
-
-# =====================
-# DATABASE INIT
-# =====================
+# ======================
+# DB INIT
+# ======================
 
 async def init_db():
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
-            coins INTEGER
+            coins INTEGER,
+            last_daily TEXT,
+            last_weekly TEXT
         )
         """)
 
@@ -64,20 +73,37 @@ async def init_db():
             user_id INTEGER,
             char_id INTEGER,
             count INTEGER,
-            PRIMARY KEY(user_id, char_id)
+            PRIMARY KEY(user_id,char_id)
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS admins(
+            user_id INTEGER PRIMARY KEY
+        )
+        """)
+
+        await db.execute("""
+        INSERT OR IGNORE INTO admins VALUES(?)
+        """,(ADMIN_ID,))
+
         await db.commit()
 
+# ======================
+# HELPERS
+# ======================
 
-# =====================
-# USER SYSTEM
-# =====================
+def today():
+    return datetime.date.today().isoformat()
+
+
+def is_admin(uid):
+    return uid == ADMIN_ID
+
 
 async def get_user(uid):
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         cur = await db.execute(
             "SELECT coins FROM users WHERE user_id=?",
@@ -88,10 +114,9 @@ async def get_user(uid):
 
         if not row:
 
-            await db.execute(
-                "INSERT INTO users VALUES(?,?)",
-                (uid, START_COINS)
-            )
+            await db.execute("""
+            INSERT INTO users VALUES(?,?,?,?)
+            """,(uid,START_COINS,None,None))
 
             await db.commit()
 
@@ -100,179 +125,297 @@ async def get_user(uid):
         return row[0]
 
 
-async def change_coins(uid, amount):
+async def add_coins(uid, amount):
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute(
-            "UPDATE users SET coins = coins + ? WHERE user_id=?",
-            (amount, uid)
+            "UPDATE users SET coins=coins+? WHERE user_id=?",
+            (amount,uid)
         )
 
         await db.commit()
 
 
-# =====================
+# ======================
 # INVENTORY
-# =====================
+# ======================
 
-async def add_character(uid, cid):
+async def add_char(uid, cid):
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute("""
-        INSERT INTO inventory(user_id,char_id,count)
-        VALUES(?,?,1)
+        INSERT INTO inventory VALUES(?,?,1)
         ON CONFLICT(user_id,char_id)
-        DO UPDATE SET count = count + 1
-        """, (uid, cid))
+        DO UPDATE SET count=count+1
+        """,(uid,cid))
 
         await db.commit()
 
 
-async def get_inventory(uid):
-
-    async with aiosqlite.connect(DB_FILE) as db:
-
-        cur = await db.execute("""
-        SELECT c.name, c.rarity, i.count
-        FROM inventory i
-        JOIN (
-            SELECT id, name, rarity FROM json_each(?)
-        ) AS c
-        """, (json.dumps(CHARACTERS),))
-
-        return await cur.fetchall()
-
-
-# =====================
-# GACHA SYSTEM
-# =====================
+# ======================
+# GACHA
+# ======================
 
 def roll_rarity():
 
     pool = []
 
-    for r, w in RARITY_RATE.items():
-        pool += [r] * w
+    for r,w in RARITY_RATE.items():
+        pool += [r]*w
 
     return random.choice(pool)
 
 
-def roll_character(rarity):
+def roll_char(r):
 
-    pool = [c for c in CHARACTERS if c["rarity"] == rarity]
+    pool = [c for c in CHARS if c["rarity"]==r]
 
     return random.choice(pool)
 
 
 async def summon(uid):
 
-    await change_coins(uid, -GACHA_COST)
+    await add_coins(uid,-GACHA_COST)
 
-    rarity = roll_rarity()
-    char = roll_character(rarity)
+    r = roll_rarity()
+    c = roll_char(r)
 
-    await add_character(uid, char["id"])
+    await add_char(uid,c["id"])
 
-    return char
+    return c
 
 
-# =====================
+# ======================
+# IMAGE CARD
+# ======================
+
+async def send_card(update,char):
+
+    await update.message.reply_photo(
+        photo=char["image"],
+        caption=
+        f"✨ {char['name']} ({char['rarity']})\n"
+        f"📺 {char['anime']}"
+    )
+
+
+# ======================
 # COMMANDS
-# =====================
+# ======================
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def start(update,ctx):
 
     coins = await get_user(update.effective_user.id)
 
     await update.message.reply_text(
-        f"🎮 Welcome!\n💰 Coins: {coins}\n\n"
-        "/summon - Gacha\n"
-        "/bal - Balance\n"
-        "/inv - Inventory\n"
-        "/top - Ranking"
+        f"🎮 Welcome\n💰 {coins} Coins\n\n"
+        "/summon\n/daily\n/weekly\n/bal\n/inv\n/top"
     )
 
 
-async def summon_cmd(update, ctx):
+# ======================
+# GACHA
+# ======================
+
+async def summon_cmd(update,ctx):
 
     uid = update.effective_user.id
 
     coins = await get_user(uid)
 
     if coins < GACHA_COST:
-        return await update.message.reply_text("❌ Not enough coins")
+        return await update.message.reply_text("❌ No coins")
 
     char = await summon(uid)
 
-    await update.message.reply_text(
-        f"✨ You got:\n"
-        f"{char['name']} ({char['rarity']})\n"
-        f"{char['anime']}"
-    )
+    await send_card(update,char)
 
 
-async def balance(update, ctx):
+# ======================
+# DAILY / WEEKLY
+# ======================
 
-    coins = await get_user(update.effective_user.id)
-
-    await update.message.reply_text(f"💰 Coins: {coins}")
-
-
-async def inventory_cmd(update, ctx):
+async def daily(update,ctx):
 
     uid = update.effective_user.id
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
 
-        cur = await db.execute("""
-        SELECT i.char_id, i.count
-        FROM inventory i
-        WHERE i.user_id=?
-        """, (uid,))
+        cur = await db.execute(
+            "SELECT last_daily FROM users WHERE user_id=?",
+            (uid,)
+        )
 
-        rows = await cur.fetchall()
+        row = await cur.fetchone()
 
-    if not rows:
-        return await update.message.reply_text("📦 Inventory empty")
+        if row and row[0]==today():
+            return await update.message.reply_text("⏳ Already claimed")
 
-    text = "📦 Your Collection\n\n"
+        await db.execute("""
+        UPDATE users SET last_daily=? WHERE user_id=?
+        """,(today(),uid))
 
-    for cid, count in rows:
+        await db.commit()
 
-        char = next(c for c in CHARACTERS if c["id"] == cid)
+    await add_coins(uid,DAILY_REWARD)
 
-        text += f"{char['name']} ({char['rarity']}) x{count}\n"
+    await update.message.reply_text(f"✅ +{DAILY_REWARD} Coins")
+
+
+async def weekly(update,ctx):
+
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB) as db:
+
+        cur = await db.execute(
+            "SELECT last_weekly FROM users WHERE user_id=?",
+            (uid,)
+        )
+
+        row = await cur.fetchone()
+
+        if row and row[0]==today():
+            return await update.message.reply_text("⏳ Already claimed")
+
+        await db.execute("""
+        UPDATE users SET last_weekly=? WHERE user_id=?
+        """,(today(),uid))
+
+        await db.commit()
+
+    await add_coins(uid,WEEKLY_REWARD)
+
+    await update.message.reply_text(f"✅ +{WEEKLY_REWARD} Coins")
+
+
+# ======================
+# ADMIN
+# ======================
+
+async def addcoins(update,ctx):
+
+    uid = update.effective_user.id
+
+    if not is_admin(uid):
+        return
+
+    user = int(ctx.args[0])
+    amt = int(ctx.args[1])
+
+    await add_coins(user,amt)
+
+    await update.message.reply_text("✅ Coins added")
+
+
+async def addadmin(update,ctx):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    new = int(ctx.args[0])
+
+    async with aiosqlite.connect(DB) as db:
+
+        await db.execute(
+            "INSERT OR IGNORE INTO admins VALUES(?)",
+            (new,)
+        )
+
+        await db.commit()
+
+    await update.message.reply_text("✅ Admin added")
+
+
+async def setdrop(update,ctx):
+
+    global DROP_TIME
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    DROP_TIME = int(ctx.args[0])
+
+    await update.message.reply_text(f"✅ Drop Time = {DROP_TIME}")
+
+
+async def store(update,ctx):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    text="🏪 Store\n\n"
+
+    for c in CHARS:
+        text+=f"{c['name']} ({c['rarity']})\n"
 
     await update.message.reply_text(text)
 
 
-async def ranking(update, ctx):
+# ======================
+# INFO
+# ======================
 
-    async with aiosqlite.connect(DB_FILE) as db:
+async def bal(update,ctx):
+
+    coins = await get_user(update.effective_user.id)
+
+    await update.message.reply_text(f"💰 {coins} Coins")
+
+
+async def inv(update,ctx):
+
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB) as db:
 
         cur = await db.execute("""
-        SELECT user_id, SUM(count) total
+        SELECT char_id,count FROM inventory WHERE user_id=?
+        """,(uid,))
+
+        rows = await cur.fetchall()
+
+    if not rows:
+        return await update.message.reply_text("Empty")
+
+    text="📦 Inventory\n\n"
+
+    for cid,c in rows:
+
+        char = next(x for x in CHARS if x["id"]==cid)
+
+        text+=f"{char['name']} x{c}\n"
+
+    await update.message.reply_text(text)
+
+
+async def top(update,ctx):
+
+    async with aiosqlite.connect(DB) as db:
+
+        cur = await db.execute("""
+        SELECT user_id,SUM(count)
         FROM inventory
         GROUP BY user_id
-        ORDER BY total DESC
+        ORDER BY 2 DESC
         LIMIT 10
         """)
 
         rows = await cur.fetchall()
 
-    text = "🏆 Top Players\n\n"
+    text="🏆 Ranking\n\n"
 
-    for i, r in enumerate(rows, 1):
-        text += f"{i}. {r[0]} → {r[1]} chars\n"
+    for i,r in enumerate(rows,1):
+        text+=f"{i}. {r[0]} → {r[1]}\n"
 
     await update.message.reply_text(text)
 
 
-# =====================
+# ======================
 # MAIN
-# =====================
+# ======================
 
 async def main():
 
@@ -280,16 +423,25 @@ async def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("summon", summon_cmd))
-    app.add_handler(CommandHandler("bal", balance))
-    app.add_handler(CommandHandler("inv", inventory_cmd))
-    app.add_handler(CommandHandler("top", ranking))
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("summon",summon_cmd))
 
-    print("✅ Bot Running")
+    app.add_handler(CommandHandler("daily",daily))
+    app.add_handler(CommandHandler("weekly",weekly))
+
+    app.add_handler(CommandHandler("addcoins",addcoins))
+    app.add_handler(CommandHandler("addadmin",addadmin))
+    app.add_handler(CommandHandler("setdroptime",setdrop))
+    app.add_handler(CommandHandler("store",store))
+
+    app.add_handler(CommandHandler("bal",bal))
+    app.add_handler(CommandHandler("inv",inv))
+    app.add_handler(CommandHandler("top",top))
+
+    print("✅ Bot Online")
 
     await app.run_polling()
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
