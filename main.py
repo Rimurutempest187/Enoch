@@ -413,16 +413,19 @@ async def top(update,ctx):
     await update.message.reply_text(text)
 
 # ======================
-# UPLOAD COMMAND (Admin Only)
+# UPLOAD COMMAND WITH TELEGRAM PHOTO
 # ======================
+
+UPLOAD_TMP = {}  # Temporarily store upload info until photo is received
 
 async def upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("❌ You are not admin")
 
-    if len(ctx.args) < 5:
+    if len(ctx.args) < 4:
         return await update.message.reply_text(
-            "Usage:\n/upload <id> <name> <anime> <rarity> <photo_url>"
+            "Usage:\n/upload <id> <name> <anime> <rarity>\n"
+            "Then reply with the character photo."
         )
 
     try:
@@ -430,43 +433,73 @@ async def upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = ctx.args[1]
         anime = ctx.args[2]
         rarity = ctx.args[3].upper()
-        photo_url = ctx.args[4]
 
         if rarity not in ["SSR", "SR", "R", "N"]:
             return await update.message.reply_text("❌ Invalid rarity: SSR/SR/R/N")
 
-        # Check if character already exists
+        # Check if ID already exists
         if any(c["id"] == char_id for c in CHARS):
             return await update.message.reply_text("❌ Character ID already exists")
 
-        # Add to memory
-        new_char = {
+        # Store temporarily until photo arrives
+        UPLOAD_TMP[update.effective_user.id] = {
             "id": char_id,
             "name": name,
             "anime": anime,
-            "rarity": rarity,
-            "image": photo_url
+            "rarity": rarity
         }
-        CHARS.append(new_char)
 
-        # Save to JSON
-        with open("characters.json", "w", encoding="utf-8") as f:
-            json.dump(CHARS, f, ensure_ascii=False, indent=4)
-
-        # Reply with photo
-        await update.message.reply_photo(
-            photo=photo_url,
-            caption=(
-                f"✅ Uploaded Character\n\n"
-                f"ID: {char_id}\n"
-                f"Name: {name}\n"
-                f"Anime: {anime}\n"
-                f"Rarity: {rarity}"
-            )
+        await update.message.reply_text(
+            "✅ Info saved. Now reply with the character photo."
         )
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if uid not in UPLOAD_TMP:
+        return  # Ignore photos not related to upload
+
+    info = UPLOAD_TMP.pop(uid)
+
+    # Save photo locally
+    photo_file = await update.message.photo[-1].get_file()
+    filename = f"images/{info['id']}.jpg"
+
+    # Make sure images folder exists
+    os.makedirs("images", exist_ok=True)
+
+    await photo_file.download_to_drive(filename)
+
+    # Add character to memory
+    new_char = {
+        "id": info["id"],
+        "name": info["name"],
+        "anime": info["anime"],
+        "rarity": info["rarity"],
+        "image": filename
+    }
+    CHARS.append(new_char)
+
+    # Save to JSON
+    with open("characters.json", "w", encoding="utf-8") as f:
+        json.dump(CHARS, f, ensure_ascii=False, indent=4)
+
+    # Reply with card
+    await update.message.reply_photo(
+        photo=filename,
+        caption=(
+            f"✅ Character Uploaded!\n\n"
+            f"ID: {info['id']}\n"
+            f"Name: {info['name']}\n"
+            f"Anime: {info['anime']}\n"
+            f"Rarity: {info['rarity']}"
+        )
+    )
+
 
 # ======================
 # MAIN
@@ -493,6 +526,7 @@ async def main():
     app.add_handler(CommandHandler("inv",inv))
     app.add_handler(CommandHandler("top",top))
     app.add_handler(CommandHandler("upload", upload))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     print("✅ Bot Online")
 
     await app.run_polling()
